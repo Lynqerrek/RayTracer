@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>GPU Path Tracer — Fragment Shader</title>
+<title>GPU Path Tracer — Cursor Light + Fixed Camera Basis</title>
 <style>
   html,body { height:100%; margin:0; background:#000; }
   canvas { display:block; width:100vw; height:100vh; }
@@ -18,17 +18,17 @@
 <div id="info">Frame: <span id="frame">0</span></div>
 
 <script>
-/* WebGL2 GPU Path Tracer
-   - Moves intersection & occlusion logic to the fragment shader
-   - Fullscreen, DPI-aware canvas
-   - Progressive accumulation via ping-pong RGBA32F textures
-   - Simple diffuse + NEE (direct sample of spherical lights)
-   - Limited bounces for performance
+/* GPU Path Tracer with:
+   - Fixed (correct) camera basis (no upside-down)
+   - Cursor-attached world light (moves with cursor; stays world-locked while orbiting camera)
+   - Progressive accumulation (ping-pong RGBA32F)
+   - WebGL2 required
 */
 
 const MAX_SPHERES = 8;
 const MAX_LIGHTS = 4;
 
+// Scene (we'll keep a cursor light as Lights[0])
 const Spheres = [
   { cx: 0, cy: 0.5, cz: -0.5, rad: 1.0, mat: 0 },
   { cx: 1.8, cy: 0.2, cz: 0.5,  rad: 0.7, mat: 1 },
@@ -36,13 +36,16 @@ const Spheres = [
 ];
 const Plane = { y: -0.5, mat: 3 };
 const Materials = [
-  { type:0, r:0.9, g:0.2, b:0.2 },
-  { type:0, r:0.7, g:0.7, b:0.7 },
-  { type:0, r:0.2, g:0.3, b:0.9 },
-  { type:0, r:0.9, g:0.9, b:0.9 },
-  { type:0, r:0.1, g:0.1, b:0.1 }
+  { r:0.9, g:0.2, b:0.2 },
+  { r:0.7, g:0.7, b:0.7 },
+  { r:0.2, g:0.3, b:0.9 },
+  { r:0.9, g:0.9, b:0.9 },
+  { r:0.1, g:0.1, b:0.1 }
 ];
+
+// Lights: Lights[0] will be the cursor light (updated on mouse moves)
 const Lights = [
+  { x: 0.0, y: 4.0, z: 2.0, rad: 0.6, r: 40.0, g: 30.0, b: 25.0 }, // cursor-attached
   { x:-5, y:8, z:5, rad:1.5, r:15, g:15, b:15 },
   { x: 5, y:5, z:2, rad:1.0, r:5, g:5, b:5 }
 ];
@@ -51,98 +54,63 @@ const canvas = document.getElementById('glcanvas');
 const infoFrame = document.getElementById('frame');
 
 let gl = canvas.getContext('webgl2', { antialias:false, preserveDrawingBuffer:false });
-if (!gl) {
-  alert('WebGL2 required');
-  throw new Error('No WebGL2');
-}
+if (!gl) { alert('WebGL2 required'); throw new Error('No WebGL2'); }
 const ext = gl.getExtension('EXT_color_buffer_float');
-if (!ext) {
-  console.warn('EXT_color_buffer_float not available — float render targets may not be supported.');
-}
+if (!ext) console.warn('EXT_color_buffer_float not available — float render targets may be degraded.');
 
-// --- Shaders ---
-// Vertex: simple passthrough
+// ---------- Shaders (same design as previous: trace --> accumulation --> display) ----------
 const vertSrc = `#version 300 es
 precision highp float;
 layout(location=0) in vec2 a_pos;
 out vec2 v_uv;
-void main(){
-  v_uv = 0.5*(a_pos+1.0);
-  gl_Position = vec4(a_pos,0.0,1.0);
-}`;
+void main(){ v_uv = 0.5*(a_pos+1.0); gl_Position = vec4(a_pos,0.0,1.0); }`;
 
-// Fragment: main path tracer that reads previous accumulation and writes new sum
 const fragTraceSrc = `#version 300 es
 precision highp float;
 precision highp int;
-
 in vec2 v_uv;
-out vec4 outColor; // writes sum (not averaged)
+out vec4 outColor;
 
-uniform sampler2D u_prevAccum; // previous accumulated sum (RGBA32F)
-uniform int u_frame; // previous frame count (0-based)
+uniform sampler2D u_prevAccum;
+uniform int u_frame;
 uniform vec2 u_resolution;
 uniform float u_time;
 
-// camera
 uniform vec3 u_camPos;
-uniform vec3 u_camF; // forward
-uniform vec3 u_camR; // right (scaled by viewport width)
-uniform vec3 u_camU; // up (scaled by viewport height)
+uniform vec3 u_camF; // forward (unit)
+uniform vec3 u_camR; // right scaled by viewport width
+uniform vec3 u_camU; // up scaled by viewport height
 
-// scene
 uniform int u_sphereCount;
-uniform vec4 u_spheres[${MAX_SPHERES}]; // (cx,cy,cz,rad)
+uniform vec4 u_spheres[${MAX_SPHERES}];
 uniform int u_sphereMat[${MAX_SPHERES}];
 uniform float u_planeY;
 uniform int u_planeMat;
 
-uniform vec3 u_materials[${Materials.length}]; // rgb
 uniform int u_materialCount;
+uniform vec3 u_materials[${Materials.length}];
 
 uniform int u_lightCount;
-uniform vec4 u_lights[${MAX_LIGHTS}]; // x,y,z,rad
-uniform vec3 u_lightCols[${MAX_LIGHTS}]; // rgb (intensity multipliers)
+uniform vec4 u_lights[${MAX_LIGHTS}];
+uniform vec3 u_lightCols[${MAX_LIGHTS}];
 
 #define PI 3.14159265359
 
-// Hash / RNG - based on pixel coords, frame, and global time
-uint hash_u(uint x) {
-    x += (x << 10u);
-    x ^= (x >> 6u);
-    x += (x << 3u);
-    x ^= (x >> 11u);
-    x += (x << 15u);
-    return x;
-}
-float rnd(inout uint state) {
-    state = hash_u(state);
-    // convert to float in [0,1)
-    return float(state & 0x00FFFFFFu) / float(0x01000000u);
-}
-uint seed_from_vec3(vec3 v, int frame) {
-    uint x = floatBitsToUint(v.x);
-    uint y = floatBitsToUint(v.y);
-    uint z = floatBitsToUint(v.z);
-    uint f = uint(frame);
-    return hash_u(x ^ (y<<10) ^ (z<<20) ^ (f*2654435761u));
+// small RNG
+uint hash_u(uint x){ x += (x<<10u); x ^= (x>>6u); x += (x<<3u); x ^= (x>>11u); x += (x<<15u); return x; }
+float rnd(inout uint s){ s = hash_u(s); return float(s & 0x00FFFFFFu) / float(0x01000000u); }
+uint seed_from(ivec2 p, int frame, float t) {
+  uint x = uint(p.x) * 73856093u;
+  uint y = uint(p.y) * 19349663u;
+  uint f = uint(frame) * 83492791u;
+  uint tt = floatBitsToUint(t);
+  return hash_u(x ^ y ^ f ^ tt);
 }
 
-// Scene intersection: returns t (Inf => miss). Also fill normal and mat index and hitType (1=sphere,2=plane)
-struct Hit {
-  float t;
-  vec3 p;
-  vec3 n;
-  int mat;
-  int hitType;
-};
+struct Hit { float t; vec3 p; vec3 n; int mat; int hitType; };
+
 Hit intersectScene(vec3 ro, vec3 rd) {
-  Hit h;
-  h.t = 1e20;
-  h.mat = -1;
-  h.hitType = 0;
-
-  // spheres
+  Hit h; h.t = 1e20; h.mat = -1; h.hitType = 0;
   for (int i=0;i<${MAX_SPHERES};++i) {
     if (i >= u_sphereCount) break;
     vec4 s = u_spheres[i];
@@ -154,30 +122,20 @@ Hit intersectScene(vec3 ro, vec3 rd) {
     if (d2 > r2) continue;
     float t = b - sqrt(r2 - d2);
     if (t > 0.001 && t < h.t) {
-      h.t = t;
-      h.p = ro + rd * t;
-      h.n = normalize(h.p - vec3(s.x,s.y,s.z));
-      h.mat = u_sphereMat[i];
-      h.hitType = 1;
+      h.t = t; h.p = ro + rd*t; h.n = normalize(h.p - vec3(s.x,s.y,s.z));
+      h.mat = u_sphereMat[i]; h.hitType = 1;
     }
   }
-
-  // plane (y = u_planeY)
   float denom = rd.y;
   if (abs(denom) > 1e-6) {
     float tp = (u_planeY - ro.y) / rd.y;
     if (tp > 0.001 && tp < h.t) {
-      h.t = tp;
-      h.p = ro + rd * tp;
-      h.n = vec3(0.0,1.0,0.0);
-      h.mat = u_planeMat;
-      h.hitType = 2;
+      h.t = tp; h.p = ro + rd*tp; h.n = vec3(0.0,1.0,0.0); h.mat = u_planeMat; h.hitType = 2;
     }
   }
   return h;
 }
 
-// Shadow / occlusion test - returns true if something blocks within maxDist
 bool occluded(vec3 ro, vec3 rd, float maxDist) {
   for (int i=0;i<${MAX_SPHERES};++i) {
     if (i >= u_sphereCount) break;
@@ -191,7 +149,6 @@ bool occluded(vec3 ro, vec3 rd, float maxDist) {
     float t = b - sqrt(r2 - d2);
     if (t > 0.001 && t < maxDist) return true;
   }
-  // plane
   if (rd.y != 0.0) {
     float tp = (u_planeY - ro.y) / rd.y;
     if (tp > 0.001 && tp < maxDist) return true;
@@ -199,14 +156,12 @@ bool occluded(vec3 ro, vec3 rd, float maxDist) {
   return false;
 }
 
-// Cosine-weighted hemisphere sample given normal and RNG
 vec3 sampleHemisphere(vec3 n, float r1, float r2) {
   float phi = 2.0 * PI * r1;
   float r = sqrt(r2);
   float x = cos(phi) * r;
   float y = sin(phi) * r;
   float z = sqrt(max(0.0, 1.0 - r2));
-  // Build tangent space
   vec3 up = abs(n.y) < 0.99 ? vec3(0.0,1.0,0.0) : vec3(1.0,0.0,0.0);
   vec3 t = normalize(cross(up, n));
   vec3 b = cross(n, t);
@@ -215,62 +170,49 @@ vec3 sampleHemisphere(vec3 n, float r1, float r2) {
 
 void main(){
   ivec2 pix = ivec2(gl_FragCoord.xy);
-  vec2 p = (v_uv * u_resolution);
-  // previous sum
+  vec2 res = u_resolution;
   vec4 prev = texture(u_prevAccum, v_uv);
 
-  // RNG seed (per-pixel + frame)
-  uint state = seed_from_vec3(vec3(float(pix.x), float(pix.y), u_time), u_frame + 1);
+  uint state = seed_from(pix, u_frame, u_time);
 
-  // generate one sample for this pixel
-  // compute primary ray
-  float jitterX = rnd(state);
-  float jitterY = rnd(state);
-  vec2 jitter = vec2(jitterX, jitterY);
-  vec2 uv = ( (v_uv * u_resolution) + jitter ) / u_resolution; // normalized jitter
+  // jittered uv for AA
+  float jx = rnd(state), jy = rnd(state);
+  vec2 uvJ = ( (gl_FragCoord.xy + vec2(jx, jy)) / res );
 
-  // build ray direction using camera basis (u_camR and u_camU already scaled to viewport)
-  vec3 rd = normalize(u_camF + u_camR * (uv.x - 0.5) + u_camU * (uv.y - 0.5));
+  // Ray dir (camR and camU are already scaled to viewport in JS)
+  vec3 rd = normalize(u_camF + u_camR * (uvJ.x - 0.5) + u_camU * (uvJ.y - 0.5));
   vec3 ro = u_camPos;
 
-  vec3 accumCol = vec3(0.0);
+  vec3 accum = vec3(0.0);
   vec3 throughput = vec3(1.0);
 
-  // small path tracer: direct NEE + 2 bounces diffuse
-  for (int bounce=0; bounce<3; ++bounce) {
+  for (int bounce=0;bounce<3;++bounce) {
     Hit h = intersectScene(ro, rd);
     if (h.t > 1e19) {
-      // Miss --> sky
       float skyT = 0.5 * (rd.y + 1.0);
-      vec3 sky = vec3(0.7*(1.0-skyT) + 0.1*skyT, 0.8*(1.0-skyT)+0.1*skyT, 1.0*(1.0-skyT)+0.3*skyT);
-      accumCol += throughput * sky;
+      vec3 sky = vec3(0.7*(1.0-skyT)+0.1*skyT, 0.8*(1.0-skyT)+0.1*skyT, 1.0*(1.0-skyT)+0.3*skyT);
+      accum += throughput * sky;
       break;
     }
 
-    // material color
     vec3 matCol = (h.mat >=0 && h.mat < u_materialCount) ? u_materials[h.mat] : vec3(0.8);
-
-    // LOD: cheap ambient if very far on first hit (imitate original)
     if (h.t > 15.0 && bounce == 0) {
       float fakeL = 0.2 + max(0.0, h.n.y) * 0.8;
-      accumCol += throughput * matCol * fakeL;
+      accum += throughput * matCol * fakeL;
       break;
     }
 
-    // Next origin slightly offset
     vec3 nextRo = h.p + h.n * 0.001;
 
-    // NEE: sample each light once
     for (int li=0; li<${MAX_LIGHTS}; ++li) {
       if (li >= u_lightCount) break;
       vec4 L = u_lights[li];
-      vec3 lightPos = vec3(L.x, L.y, L.z);
+      vec3 lightPos = vec3(L.x,L.y,L.z);
       float lrad = L.w;
 
-      // sample point on spherical light (uniform on cap/hemisphere approx)
       float r1 = rnd(state);
       float r2 = rnd(state);
-      float z = 1.0 - r2*(1.0); // bias towards surface, simple
+      float z = 1.0 - r2;
       float phi = 2.0 * PI * r1;
       vec3 samp = lightPos + lrad * vec3(cos(phi)*sqrt(max(0.0,1.0-z*z)), sin(phi)*sqrt(max(0.0,1.0-z*z)), z);
 
@@ -281,24 +223,18 @@ void main(){
 
       float nl = max(0.0, dot(h.n, Ldir));
       if (nl > 0.0) {
-        // shadow test
         if (!occluded(nextRo, Ldir, dist - 0.01)) {
-          vec3 Li = u_lightCols[li] / dist2; // intensity falloff
-          accumCol += throughput * matCol * Li * nl;
+          vec3 Li = u_lightCols[li] / dist2;
+          accum += throughput * matCol * Li * nl;
         }
       }
     }
 
-    // sample bounce direction (cosine hemisphere)
-    float rr1 = rnd(state);
-    float rr2 = rnd(state);
-    vec3 newDir = sampleHemisphere(h.n, rr1, rr2);
-    rd = newDir;
-    ro = nextRo;
-
+    float r1 = rnd(state), r2 = rnd(state);
+    vec3 newDir = sampleHemisphere(h.n, r1, r2);
+    rd = newDir; ro = nextRo;
     throughput *= matCol;
 
-    // Russian roulette after 2 bounces
     if (bounce >= 1) {
       float p = max(throughput.r, max(throughput.g, throughput.b));
       if (rnd(state) > p) break;
@@ -306,29 +242,26 @@ void main(){
     }
   }
 
-  // accumulate: write prev + sample
-  vec3 newSum = prev.rgb + accumCol;
+  vec3 newSum = prev.rgb + accum;
   outColor = vec4(newSum, 1.0);
 }
 `;
 
-// Fragment for final display: read accumulated sum, divide by frameCount, apply gamma sqrt and write to default framebuffer
 const fragDisplaySrc = `#version 300 es
 precision highp float;
 in vec2 v_uv;
 out vec4 fragColor;
 uniform sampler2D u_accum;
-uniform float u_displayFrame; // number of samples accumulated
+uniform float u_displayFrame;
 void main(){
   vec3 sum = texture(u_accum, v_uv).rgb;
   vec3 avg = sum / max(1.0, u_displayFrame);
-  // fast gamma 2.0
   vec3 col = sqrt(max(vec3(0.0), avg));
   fragColor = vec4(col,1.0);
 }
 `;
 
-// --- GL helpers
+// ---------- GL helper functions ----------
 function compileShader(src, type) {
   const s = gl.createShader(type);
   gl.shaderSource(s, src);
@@ -341,8 +274,7 @@ function compileShader(src, type) {
 }
 function linkProgram(vs, fs) {
   const p = gl.createProgram();
-  gl.attachShader(p, vs);
-  gl.attachShader(p, fs);
+  gl.attachShader(p, vs); gl.attachShader(p, fs);
   gl.bindAttribLocation(p, 0, 'a_pos');
   gl.linkProgram(p);
   if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
@@ -352,23 +284,17 @@ function linkProgram(vs, fs) {
   return p;
 }
 
-// fullscreen quad
+// Fullscreen quad
 const quadVBO = gl.createBuffer();
 gl.bindBuffer(gl.ARRAY_BUFFER, quadVBO);
-const quadVerts = new Float32Array([
-  -1,-1,  1,-1,  -1,1,
-  -1,1,   1,-1,   1,1
-]);
-gl.bufferData(gl.ARRAY_BUFFER, quadVerts, gl.STATIC_DRAW);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,1,-1,-1,1, -1,1,1,-1,1,1]), gl.STATIC_DRAW);
 
-// compile programs
 const vs = compileShader(vertSrc, gl.VERTEX_SHADER);
 const fsTrace = compileShader(fragTraceSrc, gl.FRAGMENT_SHADER);
 const fsDisplay = compileShader(fragDisplaySrc, gl.FRAGMENT_SHADER);
 const progTrace = linkProgram(vs, fsTrace);
 const progDisplay = linkProgram(vs, fsDisplay);
 
-// get uniform locations for trace program
 const traceUniforms = {
   u_prevAccum: gl.getUniformLocation(progTrace, 'u_prevAccum'),
   u_frame: gl.getUniformLocation(progTrace, 'u_frame'),
@@ -382,31 +308,24 @@ const traceUniforms = {
   u_planeY: gl.getUniformLocation(progTrace, 'u_planeY'),
   u_planeMat: gl.getUniformLocation(progTrace, 'u_planeMat'),
   u_materialCount: gl.getUniformLocation(progTrace, 'u_materialCount'),
-  u_lightCount: gl.getUniformLocation(progTrace, 'u_lightCount'),
-  // arrays: set by name below
+  u_lightCount: gl.getUniformLocation(progTrace, 'u_lightCount')
 };
-
-// display uniforms
 const dispUniforms = {
   u_accum: gl.getUniformLocation(progDisplay, 'u_accum'),
   u_displayFrame: gl.getUniformLocation(progDisplay, 'u_displayFrame')
 };
 
-// helper to set up attribute
 function bindQuadToProgram() {
   gl.bindBuffer(gl.ARRAY_BUFFER, quadVBO);
   gl.enableVertexAttribArray(0);
   gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
 }
 
-// create ping-pong float textures + framebuffers
+// Ping-pong textures
 let tex = [null, null], fb = [null, null];
 function createAccumBuffers(w,h) {
   for (let i=0;i<2;i++) {
-    if (tex[i]) {
-      gl.deleteTexture(tex[i]);
-      gl.deleteFramebuffer(fb[i]);
-    }
+    if (tex[i]) { gl.deleteTexture(tex[i]); gl.deleteFramebuffer(fb[i]); }
     const t = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, t);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
@@ -419,141 +338,171 @@ function createAccumBuffers(w,h) {
     gl.bindFramebuffer(gl.FRAMEBUFFER, f);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
     const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
-    if (status !== gl.FRAMEBUFFER_COMPLETE) {
-      console.warn('Framebuffer incomplete', status);
-    }
+    if (status !== gl.FRAMEBUFFER_COMPLETE) console.warn('Framebuffer incomplete', status);
 
-    tex[i] = t;
-    fb[i] = f;
+    tex[i] = t; fb[i] = f;
   }
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 }
 
-// fullscreen resize & DPI
+// ---------- Resize / viewport ----------
 function resize() {
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  const width = Math.max(1, Math.floor(window.innerWidth * dpr));
-  const height = Math.max(1, Math.floor(window.innerHeight * dpr));
-  canvas.width = width;
-  canvas.height = height;
+  const w = Math.max(1, Math.floor(window.innerWidth * dpr));
+  const h = Math.max(1, Math.floor(window.innerHeight * dpr));
+  canvas.width = w; canvas.height = h;
   canvas.style.width = window.innerWidth + 'px';
   canvas.style.height = window.innerHeight + 'px';
-  gl.viewport(0,0,width,height);
-  createAccumBuffers(width, height);
+  gl.viewport(0,0,w,h);
+  createAccumBuffers(w,h);
   frame = 0;
   updateFrameInfo();
 }
 window.addEventListener('resize', () => { resize(); resetAccumulation(); });
 
-// camera state
+// ---------- Camera (correct basis math) ----------
 let camDist = 7.0;
 let camAzi = Math.PI/2 + 0.5;
 let camEle = 0.4;
 let camTarget = { x:0, y:0.2, z:0 };
-let camPos = [0,0,0], camF=[0,0,0], camR=[0,0,0], camU=[0,0,0];
+
+let camPos = [0,0,0];
+let camF = [0,0,0];      // unit forward (target - pos)
+let camRightUnit = [0,0,0]; // unit right
+let camUpUnit = [0,0,0];    // unit up
+let camR = [0,0,0]; // scaled to viewport width
+let camU = [0,0,0]; // scaled to viewport height
+
+function normalize(v) { const l = Math.hypot(v[0],v[1],v[2]) || 1; return [v[0]/l, v[1]/l, v[2]/l]; }
+function cross(a,b){ return [ a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0] ]; }
+function sub(a,b){ return [a[0]-b[0], a[1]-b[1], a[2]-b[2]]; }
+function mulScalar(v,s){ return [v[0]*s, v[1]*s, v[2]*s]; }
 
 function updateCamera() {
+  // position in spherical coords
   const y = camDist * Math.sin(camEle);
   const r = camDist * Math.cos(camEle);
   camPos[0] = camTarget.x + r * Math.sin(camAzi);
   camPos[1] = camTarget.y + y;
   camPos[2] = camTarget.z + r * Math.cos(camAzi);
 
-  let fx = camTarget.x - camPos[0];
-  let fy = camTarget.y - camPos[1];
-  let fz = camTarget.z - camPos[2];
-  let flen = Math.hypot(fx,fy,fz);
-  camF[0] = fx / flen; camF[1] = fy / flen; camF[2] = fz / flen;
+  // forward = normalize(target - pos)
+  const ftmp = normalize([camTarget.x - camPos[0], camTarget.y - camPos[1], camTarget.z - camPos[2]]);
+  camF = ftmp;
 
-  // right vector (approx)
-  let rx = camF[2];
-  let ry = 0;
-  let rz = -camF[0];
-  let rlen = Math.hypot(rx,ry,rz);
-  camR[0] = rx / rlen; camR[1] = ry / rlen; camR[2] = rz / rlen;
+  // right = normalize(cross(forward, worldUp))
+  const worldUp = [0,1,0];
+  let rgt = cross(camF, worldUp);
+  rgt = normalize(rgt);
+  camRightUnit = rgt;
 
-  camU[0] = camR[1]*camF[2] - camR[2]*camF[1];
-  camU[1] = camR[2]*camF[0] - camR[0]*camF[2];
-  camU[2] = camR[0]*camF[1] - camR[1]*camF[0];
+  // up = cross(right, forward)
+  let upv = cross(camRightUnit, camF);
+  upv = normalize(upv);
+  camUpUnit = upv;
 
-  // scale to viewport fov
+  // scale to viewport
   const fov = 60.0 * Math.PI/180.0;
-  const h = 2.0 * Math.tan(0.5 * fov);
+  const vpH = 2.0 * Math.tan(0.5 * fov);
   const aspect = canvas.width / canvas.height;
-  const vpW = h * aspect;
-  // scale camR and camU to viewport width/height
-  camR[0] *= vpW; camR[1] *= vpW; camR[2] *= vpW;
-  camU[0] *= h; camU[1] *= h; camU[2] *= h;
+  const vpW = vpH * aspect;
+
+  camR = mulScalar(camRightUnit, vpW); // scaled
+  camU = mulScalar(camUpUnit, vpH);    // scaled
+
+  // reset accumulation when camera moves
   resetAccumulation();
 }
 
-// user interaction
-let isDragging = false, lastX=0, lastY=0;
+// ---------- Interaction ----------
+// Camera drag vs cursor light: when dragging (isDragging=true), we rotate camera and do NOT update cursor light.
+// When not dragging, mouse moves update the cursor light world position.
+let isDragging = false, lastX = 0, lastY = 0;
 canvas.addEventListener('mousedown', (e)=>{ isDragging=true; lastX=e.clientX; lastY=e.clientY; });
 window.addEventListener('mouseup', ()=>{ isDragging=false; });
 window.addEventListener('mousemove', (e)=>{
-  if(!isDragging) return;
-  const dx = (e.clientX - lastX) * 0.005;
-  const dy = (e.clientY - lastY) * 0.005;
-  camAzi -= dx;
-  camEle = Math.max(-1.5, Math.min(1.5, camEle + dy));
-  lastX = e.clientX; lastY = e.clientY;
-  updateCamera();
+  if (isDragging) {
+    const dx = (e.clientX - lastX) * 0.005;
+    const dy = (e.clientY - lastY) * 0.005;
+    camAzi -= dx;
+    camEle = Math.max(-1.5, Math.min(1.5, camEle + dy));
+    lastX = e.clientX; lastY = e.clientY;
+    updateCamera();
+  } else {
+    updateCursorLightFromMouse(e.clientX, e.clientY);
+  }
 });
-canvas.addEventListener('wheel', (e) => {
-  e.preventDefault();
-  camDist = Math.max(2, Math.min(20, camDist + e.deltaY * 0.01));
-  updateCamera();
-},{passive:false});
+canvas.addEventListener('wheel', (e)=>{ e.preventDefault(); camDist = Math.max(2, Math.min(20, camDist + e.deltaY * 0.01)); updateCamera(); }, { passive:false });
 
-let frame = 0;
-function updateFrameInfo(){ infoFrame.textContent = String(frame); }
+// Compute a world-space ray from camera through screen pixel, then place the cursor light at a fixed distance along that ray.
+// Important: when camera moves, we DO NOT recompute the cursor light unless the user moves the mouse (so the light remains world-locked).
+function updateCursorLightFromMouse(clientX, clientY) {
+  // convert to canvas pixel coords (physical)
+  const rect = canvas.getBoundingClientRect();
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  // convert client coords to canvas pixel coordinates (physical pixels)
+  const px = (clientX - rect.left) * dpr;
+  const py = (clientY - rect.top) * dpr;
+  // normalized uv in [0,1]
+  const u = px / canvas.width;
+  const v = py / canvas.height;
 
-// reset accumulation
-function resetAccumulation() {
-  frame = 0;
-  // clear both accumulation textures to zero
-  gl.bindFramebuffer(gl.FRAMEBUFFER, fb[0]);
-  gl.clearColor(0,0,0,0);
-  gl.clear(gl.COLOR_BUFFER_BIT);
-  gl.bindFramebuffer(gl.FRAMEBUFFER, fb[1]);
-  gl.clearColor(0,0,0,0);
-  gl.clear(gl.COLOR_BUFFER_BIT);
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  updateFrameInfo();
+  // build ray (copying shader construction)
+  const ux = u - 0.5;
+  const vy = v - 0.5;
+  // rd = normalize(camF + camR * ux + camU * vy)
+  let rd = [
+    camF[0] + camR[0] * ux + camU[0] * vy,
+    camF[1] + camR[1] * ux + camU[1] * vy,
+    camF[2] + camR[2] * ux + camU[2] * vy
+  ];
+  const len = Math.hypot(rd[0], rd[1], rd[2]) || 1;
+  rd = [rd[0]/len, rd[1]/len, rd[2]/len];
+
+  const lightDistance = 6.0; // how far from camera the cursor light will sit (world units)
+  const pos = [ camPos[0] + rd[0]*lightDistance, camPos[1] + rd[1]*lightDistance, camPos[2] + rd[2]*lightDistance ];
+
+  // write into Lights[0] (world locked until next mouse move)
+  Lights[0].x = pos[0];
+  Lights[0].y = pos[1];
+  Lights[0].z = pos[2];
+
+  // reset accumulation to reflect new light position
+  resetAccumulation();
 }
 
-// upload scene uniforms (spheres, materials, lights)
+// Initialize cursor light at screen center
+function initCursorLight() {
+  const cx = canvas.width * 0.5 / (window.devicePixelRatio || 1);
+  const cy = canvas.height * 0.5 / (window.devicePixelRatio || 1);
+  updateCursorLightFromMouse(cx, cy);
+}
+
+// ---------- Scene uniform upload ----------
 function setSceneUniforms() {
   gl.useProgram(progTrace);
   gl.uniform1i(traceUniforms.u_sphereCount, Spheres.length);
-  // spheres
   for (let i=0;i<MAX_SPHERES;i++) {
-    const name = `u_spheres[${i}]`;
-    const loc = gl.getUniformLocation(progTrace, name);
+    const loc = gl.getUniformLocation(progTrace, `u_spheres[${i}]`);
     if (i < Spheres.length) {
       const s = Spheres[i];
       gl.uniform4f(loc, s.cx, s.cy, s.cz, s.rad);
-    } else {
-      gl.uniform4f(loc, 0,0,0,0);
-    }
+    } else gl.uniform4f(loc, 0,0,0,0);
     const locMat = gl.getUniformLocation(progTrace, `u_sphereMat[${i}]`);
     gl.uniform1i(locMat, i < Spheres.length ? Spheres[i].mat : 0);
   }
   gl.uniform1f(traceUniforms.u_planeY, Plane.y);
   gl.uniform1i(traceUniforms.u_planeMat, Plane.mat);
 
-  // materials
-  for (let i=0;i<Materials.length;i++){
+  for (let i=0;i<Materials.length;i++) {
     const loc = gl.getUniformLocation(progTrace, `u_materials[${i}]`);
     const m = Materials[i];
     gl.uniform3f(loc, m.r, m.g, m.b);
   }
   gl.uniform1i(traceUniforms.u_materialCount, Materials.length);
 
-  // lights
   gl.uniform1i(traceUniforms.u_lightCount, Lights.length);
-  for (let i=0;i<MAX_LIGHTS;i++){
+  for (let i=0;i<MAX_LIGHTS;i++) {
     const locL = gl.getUniformLocation(progTrace, `u_lights[${i}]`);
     const locCol = gl.getUniformLocation(progTrace, `u_lightCols[${i}]`);
     if (i < Lights.length) {
@@ -567,31 +516,41 @@ function setSceneUniforms() {
   }
 }
 
-// main render loop (ping-pong accumulation)
+// ---------- Render loop (ping-pong) ----------
 let writeIndex = 0, readIndex = 1;
+let frame = 0;
+function updateFrameInfo(){ infoFrame.textContent = String(frame); }
+
+function resetAccumulation() {
+  frame = 0;
+  // clear both accumulation textures
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb[0]); gl.clearColor(0,0,0,0); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb[1]); gl.clearColor(0,0,0,0); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  updateFrameInfo();
+}
+
 function render() {
-  // trace pass: read from tex[readIndex], write to fb[writeIndex]
+  // Trace pass (write to fb[writeIndex], reading tex[readIndex])
   gl.bindFramebuffer(gl.FRAMEBUFFER, fb[writeIndex]);
   gl.useProgram(progTrace);
   bindQuadToProgram();
 
-  // set generic uniforms
   gl.activeTexture(gl.TEXTURE0);
   gl.bindTexture(gl.TEXTURE_2D, tex[readIndex]);
   gl.uniform1i(traceUniforms.u_prevAccum, 0);
   gl.uniform1i(traceUniforms.u_frame, frame);
   gl.uniform2f(traceUniforms.u_resolution, canvas.width, canvas.height);
-  gl.uniform1f(traceUniforms.u_time, performance.now() * 0.001);
+  gl.uniform1f(traceUniforms.u_time, performance.now()*0.001);
   gl.uniform3fv(traceUniforms.u_camPos, camPos);
   gl.uniform3fv(traceUniforms.u_camF, camF);
   gl.uniform3fv(traceUniforms.u_camR, camR);
   gl.uniform3fv(traceUniforms.u_camU, camU);
 
   setSceneUniforms();
-
   gl.drawArrays(gl.TRIANGLES, 0, 6);
 
-  // display pass: draw to default framebuffer using tex[writeIndex]
+  // Display pass
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   gl.useProgram(progDisplay);
   bindQuadToProgram();
@@ -602,18 +561,66 @@ function render() {
   gl.drawArrays(gl.TRIANGLES, 0, 6);
 
   // swap
-  const tmp = writeIndex; writeIndex = readIndex; readIndex = tmp;
+  [writeIndex, readIndex] = [readIndex, writeIndex];
   frame++;
   updateFrameInfo();
   requestAnimationFrame(render);
 }
 
-// initialize
-resize();
+// ---------- Init ----------
+function init() {
+  resize();
+  updateCamera();
+  setSceneUniforms();
+  initCursorLight();
+  resetAccumulation();
+  requestAnimationFrame(render);
+}
+
+window.addEventListener('load', init);
+
+// ---------- Initialization helpers ----------
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.max(1, Math.floor(window.innerWidth * dpr));
+  const h = Math.max(1, Math.floor(window.innerHeight * dpr));
+  canvas.width = w; canvas.height = h;
+  canvas.style.width = window.innerWidth + 'px';
+  canvas.style.height = window.innerHeight + 'px';
+  gl.viewport(0,0,w,h);
+  createAccumBuffers(w,h);
+  frame = 0;
+  updateFrameInfo();
+}
+
+// createAccumBuffers implementation (placed here to avoid forward reference)
+function createAccumBuffers(w,h) {
+  for (let i=0;i<2;i++) {
+    if (tex[i]) { gl.deleteTexture(tex[i]); gl.deleteFramebuffer(fb[i]); }
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, null);
+
+    const f = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    if (status !== gl.FRAMEBUFFER_COMPLETE) console.warn('Framebuffer incomplete', status);
+
+    tex[i] = t; fb[i] = f;
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+
+// update scene uniform each frame (lights/cam) handled in render's setSceneUniforms()
+
+// ensure we initialize camera and cursor light when script runs
 updateCamera();
-setSceneUniforms();
-resetAccumulation();
-requestAnimationFrame(render);
+initCursorLight();
 
 </script>
 </body>
