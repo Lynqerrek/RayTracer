@@ -3,484 +3,618 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>GPU Path Tracer — PingPong Accumulation</title>
+<title>GPU Path Tracer — Fragment Shader</title>
 <style>
   html,body { height:100%; margin:0; background:#000; }
-  #glcanvas { display:block; width:100vw; height:100vh; }
-  #msg { position:fixed; left:8px; top:8px; color:#ddd; font-family:monospace; background:rgba(0,0,0,0.6); padding:6px 10px; border-radius:6px; }
+  canvas { display:block; width:100vw; height:100vh; }
+  #info {
+    position:fixed; left:8px; top:8px; color:#ddd; font-family:monospace;
+    background:rgba(0,0,0,0.4); padding:6px 8px; border-radius:6px; font-size:13px;
+  }
 </style>
 </head>
 <body>
 <canvas id="glcanvas"></canvas>
-<div id="msg">Initializing…</div>
+<div id="info">Frame: <span id="frame">0</span></div>
 
 <script>
-/* Ping-pong accumulation path tracer (WebGL2).
-   - No additive blending: safe ping-pong of two RGBA32F textures.
-   - Single-sample-per-frame (fast interactivity) — can be increased later.
-   - WebGL2 + EXT_color_buffer_float required.
+/* WebGL2 GPU Path Tracer
+   - Moves intersection & occlusion logic to the fragment shader
+   - Fullscreen, DPI-aware canvas
+   - Progressive accumulation via ping-pong RGBA32F textures
+   - Simple diffuse + NEE (direct sample of spherical lights)
+   - Limited bounces for performance
 */
 
-const VERT_SRC = `#version 300 es
-in vec2 a_pos;
+const MAX_SPHERES = 8;
+const MAX_LIGHTS = 4;
+
+const Spheres = [
+  { cx: 0, cy: 0.5, cz: -0.5, rad: 1.0, mat: 0 },
+  { cx: 1.8, cy: 0.2, cz: 0.5,  rad: 0.7, mat: 1 },
+  { cx:-1.8, cy: 0.2, cz: 0.0,  rad: 0.7, mat: 2 }
+];
+const Plane = { y: -0.5, mat: 3 };
+const Materials = [
+  { type:0, r:0.9, g:0.2, b:0.2 },
+  { type:0, r:0.7, g:0.7, b:0.7 },
+  { type:0, r:0.2, g:0.3, b:0.9 },
+  { type:0, r:0.9, g:0.9, b:0.9 },
+  { type:0, r:0.1, g:0.1, b:0.1 }
+];
+const Lights = [
+  { x:-5, y:8, z:5, rad:1.5, r:15, g:15, b:15 },
+  { x: 5, y:5, z:2, rad:1.0, r:5, g:5, b:5 }
+];
+
+const canvas = document.getElementById('glcanvas');
+const infoFrame = document.getElementById('frame');
+
+let gl = canvas.getContext('webgl2', { antialias:false, preserveDrawingBuffer:false });
+if (!gl) {
+  alert('WebGL2 required');
+  throw new Error('No WebGL2');
+}
+const ext = gl.getExtension('EXT_color_buffer_float');
+if (!ext) {
+  console.warn('EXT_color_buffer_float not available — float render targets may not be supported.');
+}
+
+// --- Shaders ---
+// Vertex: simple passthrough
+const vertSrc = `#version 300 es
+precision highp float;
+layout(location=0) in vec2 a_pos;
 out vec2 v_uv;
 void main(){
-  v_uv = a_pos * 0.5 + 0.5;
-  gl_Position = vec4(a_pos, 0.0, 1.0);
-}
-`;
+  v_uv = 0.5*(a_pos+1.0);
+  gl_Position = vec4(a_pos,0.0,1.0);
+}`;
 
-// Sample+Accumulate shader: reads previous accumulation texture and writes prev + sample
-const FRAG_SAMPLE_SRC = `#version 300 es
+// Fragment: main path tracer that reads previous accumulation and writes new sum
+const fragTraceSrc = `#version 300 es
 precision highp float;
 precision highp int;
+
 in vec2 v_uv;
-out vec4 outColor;
+out vec4 outColor; // writes sum (not averaged)
 
-uniform sampler2D u_prevAccum;
+uniform sampler2D u_prevAccum; // previous accumulated sum (RGBA32F)
+uniform int u_frame; // previous frame count (0-based)
 uniform vec2 u_resolution;
-uniform int u_frame;
+uniform float u_time;
+
+// camera
 uniform vec3 u_camPos;
-uniform vec3 u_camForward;
-uniform vec3 u_camRight;
-uniform vec3 u_camUp;
-uniform float u_fov;
-uniform float u_aspect;
+uniform vec3 u_camF; // forward
+uniform vec3 u_camR; // right (scaled by viewport width)
+uniform vec3 u_camU; // up (scaled by viewport height)
 
-#define MAX_SPH 8
-#define MAX_LIGHTS 8
+// scene
 uniform int u_sphereCount;
-uniform vec4 u_spheres[MAX_SPH];
-uniform int u_sphereMatIdx[MAX_SPH];
-uniform int u_matCount;
-uniform vec3 u_mats[16];
+uniform vec4 u_spheres[${MAX_SPHERES}]; // (cx,cy,cz,rad)
+uniform int u_sphereMat[${MAX_SPHERES}];
+uniform float u_planeY;
+uniform int u_planeMat;
+
+uniform vec3 u_materials[${Materials.length}]; // rgb
+uniform int u_materialCount;
+
 uniform int u_lightCount;
-uniform vec4 u_lights[MAX_LIGHTS];
-uniform vec3 u_lightCols[MAX_LIGHTS];
+uniform vec4 u_lights[${MAX_LIGHTS}]; // x,y,z,rad
+uniform vec3 u_lightCols[${MAX_LIGHTS}]; // rgb (intensity multipliers)
 
-const float PI = 3.141592653589793;
-const float SHADOW_BIAS = 0.001;
-const float TRACE_LIMIT = 15.0;
+#define PI 3.14159265359
 
-uint wang_hash(uint seed) {
-  seed = (seed ^ 61u) ^ (seed >> 16);
-  seed *= 9u;
-  seed = seed ^ (seed >> 4);
-  seed *= 0x27d4eb2du;
-  seed = seed ^ (seed >> 15);
-  return seed;
+// Hash / RNG - based on pixel coords, frame, and global time
+uint hash_u(uint x) {
+    x += (x << 10u);
+    x ^= (x >> 6u);
+    x += (x << 3u);
+    x ^= (x >> 11u);
+    x += (x << 15u);
+    return x;
 }
 float rnd(inout uint state) {
-  state = wang_hash(state);
-  return float(state) / 4294967296.0;
+    state = hash_u(state);
+    // convert to float in [0,1)
+    return float(state & 0x00FFFFFFu) / float(0x01000000u);
+}
+uint seed_from_vec3(vec3 v, int frame) {
+    uint x = floatBitsToUint(v.x);
+    uint y = floatBitsToUint(v.y);
+    uint z = floatBitsToUint(v.z);
+    uint f = uint(frame);
+    return hash_u(x ^ (y<<10) ^ (z<<20) ^ (f*2654435761u));
 }
 
+// Scene intersection: returns t (Inf => miss). Also fill normal and mat index and hitType (1=sphere,2=plane)
 struct Hit {
   float t;
-  int hitType;
-  int mat;
-  vec3 pos;
+  vec3 p;
   vec3 n;
+  int mat;
+  int hitType;
 };
-
 Hit intersectScene(vec3 ro, vec3 rd) {
-  Hit res; res.t = 1e20; res.hitType = 0; res.mat = 0;
-  for (int i=0;i<MAX_SPH;i++){
-    if(i>=u_sphereCount) break;
+  Hit h;
+  h.t = 1e20;
+  h.mat = -1;
+  h.hitType = 0;
+
+  // spheres
+  for (int i=0;i<${MAX_SPHERES};++i) {
+    if (i >= u_sphereCount) break;
     vec4 s = u_spheres[i];
     vec3 oc = vec3(s.x,s.y,s.z) - ro;
     float b = dot(oc, rd);
     if (b < 0.0) continue;
-    float r2 = s.w*s.w;
     float d2 = dot(oc,oc) - b*b;
+    float r2 = s.w*s.w;
     if (d2 > r2) continue;
-    float t = b - sqrt(max(0.0, r2 - d2));
-    if (t > 0.001 && t < res.t) {
-      res.t = t; res.hitType = 1; res.mat = u_sphereMatIdx[i];
-      res.pos = ro + rd * t; res.n = normalize(res.pos - vec3(s.x,s.y,s.z));
+    float t = b - sqrt(r2 - d2);
+    if (t > 0.001 && t < h.t) {
+      h.t = t;
+      h.p = ro + rd * t;
+      h.n = normalize(h.p - vec3(s.x,s.y,s.z));
+      h.mat = u_sphereMat[i];
+      h.hitType = 1;
     }
   }
-  float py = -0.5;
-  if (abs(rd.y) > 1e-6) {
-    float t = (py - ro.y) / rd.y;
-    if (t > 0.001 && t < res.t) {
-      res.t = t; res.hitType = 2; res.mat = 3;
-      res.pos = ro + rd * t; res.n = vec3(0.0,1.0,0.0);
-      float cx = floor(res.pos.x);
-      float cz = floor(res.pos.z);
-      if (mod(cx + cz, 2.0) != 0.0) res.mat = 4;
+
+  // plane (y = u_planeY)
+  float denom = rd.y;
+  if (abs(denom) > 1e-6) {
+    float tp = (u_planeY - ro.y) / rd.y;
+    if (tp > 0.001 && tp < h.t) {
+      h.t = tp;
+      h.p = ro + rd * tp;
+      h.n = vec3(0.0,1.0,0.0);
+      h.mat = u_planeMat;
+      h.hitType = 2;
     }
   }
-  return res;
+  return h;
 }
 
-bool intersectShadow(vec3 ro, vec3 rd, float maxDist){
-  for (int i=0;i<MAX_SPH;i++){
-    if(i>=u_sphereCount) break;
+// Shadow / occlusion test - returns true if something blocks within maxDist
+bool occluded(vec3 ro, vec3 rd, float maxDist) {
+  for (int i=0;i<${MAX_SPHERES};++i) {
+    if (i >= u_sphereCount) break;
     vec4 s = u_spheres[i];
     vec3 oc = vec3(s.x,s.y,s.z) - ro;
     float b = dot(oc, rd);
     if (b < 0.0) continue;
-    float r2 = s.w*s.w;
     float d2 = dot(oc,oc) - b*b;
+    float r2 = s.w*s.w;
     if (d2 > r2) continue;
-    float t = b - sqrt(max(0.0, r2 - d2));
-    if (t > SHADOW_BIAS && t < maxDist) return true;
+    float t = b - sqrt(r2 - d2);
+    if (t > 0.001 && t < maxDist) return true;
   }
-  float py = -0.5;
-  if (abs(rd.y) > 1e-6) {
-    float t = (py - ro.y) / rd.y;
-    if (t > SHADOW_BIAS && t < maxDist) return true;
+  // plane
+  if (rd.y != 0.0) {
+    float tp = (u_planeY - ro.y) / rd.y;
+    if (tp > 0.001 && tp < maxDist) return true;
   }
   return false;
 }
 
-vec3 sampleHemisphere(vec3 n, float u1, float u2) {
-  float r = sqrt(u1);
-  float theta = 2.0 * PI * u2;
-  vec3 tangent = abs(n.x) > 0.1 ? normalize(cross(n, vec3(0.0,1.0,0.0))) : normalize(cross(n, vec3(1.0,0.0,0.0)));
-  vec3 bit = cross(n, tangent);
-  return normalize(tangent * (r * cos(theta)) + bit * (r * sin(theta)) + n * sqrt(max(0.0, 1.0 - u1)));
+// Cosine-weighted hemisphere sample given normal and RNG
+vec3 sampleHemisphere(vec3 n, float r1, float r2) {
+  float phi = 2.0 * PI * r1;
+  float r = sqrt(r2);
+  float x = cos(phi) * r;
+  float y = sin(phi) * r;
+  float z = sqrt(max(0.0, 1.0 - r2));
+  // Build tangent space
+  vec3 up = abs(n.y) < 0.99 ? vec3(0.0,1.0,0.0) : vec3(1.0,0.0,0.0);
+  vec3 t = normalize(cross(up, n));
+  vec3 b = cross(n, t);
+  return normalize(t * x + b * y + n * z);
 }
 
 void main(){
-  // previous accumulation
-  vec3 prev = texture(u_prevAccum, v_uv).rgb;
+  ivec2 pix = ivec2(gl_FragCoord.xy);
+  vec2 p = (v_uv * u_resolution);
+  // previous sum
+  vec4 prev = texture(u_prevAccum, v_uv);
 
-  ivec2 ip = ivec2(gl_FragCoord.xy);
-  uint seed = uint(u_frame) * 1973u + uint(ip.x) * 9277u + uint(ip.y) * 2663u + 0x9e3779b9u;
-  float jx = rnd(seed), jy = rnd(seed);
+  // RNG seed (per-pixel + frame)
+  uint state = seed_from_vec3(vec3(float(pix.x), float(pix.y), u_time), u_frame + 1);
 
-  vec2 pixel = v_uv * u_resolution;
-  vec2 uv = (pixel + vec2(jx,jy)) / u_resolution;
-  float ndcY = (1.0 - uv.y) * 2.0 - 1.0;
-  float ndcX = (uv.x * 2.0 - 1.0) * u_aspect;
+  // generate one sample for this pixel
+  // compute primary ray
+  float jitterX = rnd(state);
+  float jitterY = rnd(state);
+  vec2 jitter = vec2(jitterX, jitterY);
+  vec2 uv = ( (v_uv * u_resolution) + jitter ) / u_resolution; // normalized jitter
 
-  float vpH = 2.0 * tan(u_fov * 0.5);
-  vec3 rayDir = normalize(u_camForward + u_camRight * ndcX * vpH * 0.5 + u_camUp * ndcY * vpH * 0.5);
+  // build ray direction using camera basis (u_camR and u_camU already scaled to viewport)
+  vec3 rd = normalize(u_camF + u_camR * (uv.x - 0.5) + u_camU * (uv.y - 0.5));
   vec3 ro = u_camPos;
-  vec3 rd = rayDir;
 
-  vec3 acc = vec3(0.0);
-  vec3 mask = vec3(1.0);
+  vec3 accumCol = vec3(0.0);
+  vec3 throughput = vec3(1.0);
 
-  for (int depth=0; depth<4; depth++){
+  // small path tracer: direct NEE + 2 bounces diffuse
+  for (int bounce=0; bounce<3; ++bounce) {
     Hit h = intersectScene(ro, rd);
-    if (h.hitType == 0){
-      float t = 0.5 * (rd.y + 1.0);
-      vec3 sky = mix(vec3(0.7,0.8,1.0)*0.1 + vec3(0.6,0.7,0.8)*0.6, vec3(0.1,0.1,0.3), t);
-      acc += mask * sky;
-      break;
-    }
-    vec3 matCol = u_mats[h.mat];
-    if (h.t > TRACE_LIMIT && depth == 0){
-      float fake = 0.2 + max(0.0, h.n.y) * 0.8;
-      acc += mask * matCol * fake;
+    if (h.t > 1e19) {
+      // Miss --> sky
+      float skyT = 0.5 * (rd.y + 1.0);
+      vec3 sky = vec3(0.7*(1.0-skyT) + 0.1*skyT, 0.8*(1.0-skyT)+0.1*skyT, 1.0*(1.0-skyT)+0.3*skyT);
+      accumCol += throughput * sky;
       break;
     }
 
-    if (u_lightCount > 0) {
-      int li = int(floor(rnd(seed) * float(u_lightCount)));
-      li = clamp(li, 0, u_lightCount-1);
+    // material color
+    vec3 matCol = (h.mat >=0 && h.mat < u_materialCount) ? u_materials[h.mat] : vec3(0.8);
+
+    // LOD: cheap ambient if very far on first hit (imitate original)
+    if (h.t > 15.0 && bounce == 0) {
+      float fakeL = 0.2 + max(0.0, h.n.y) * 0.8;
+      accumCol += throughput * matCol * fakeL;
+      break;
+    }
+
+    // Next origin slightly offset
+    vec3 nextRo = h.p + h.n * 0.001;
+
+    // NEE: sample each light once
+    for (int li=0; li<${MAX_LIGHTS}; ++li) {
+      if (li >= u_lightCount) break;
       vec4 L = u_lights[li];
-      vec3 Lcol = u_lightCols[li];
+      vec3 lightPos = vec3(L.x, L.y, L.z);
+      float lrad = L.w;
 
-      float ar1 = rnd(seed) * 2.0 * PI;
-      float ar2 = rnd(seed);
-      float r = L.w * sqrt(ar2);
-      vec3 pOnLight = vec3(L.x, L.y, L.z) + vec3(r * cos(ar1), r * sin(ar1), 0.0);
+      // sample point on spherical light (uniform on cap/hemisphere approx)
+      float r1 = rnd(state);
+      float r2 = rnd(state);
+      float z = 1.0 - r2*(1.0); // bias towards surface, simple
+      float phi = 2.0 * PI * r1;
+      vec3 samp = lightPos + lrad * vec3(cos(phi)*sqrt(max(0.0,1.0-z*z)), sin(phi)*sqrt(max(0.0,1.0-z*z)), z);
 
-      vec3 ldir = pOnLight - (h.pos + h.n * SHADOW_BIAS);
-      float dist2 = dot(ldir, ldir);
+      vec3 toL = samp - nextRo;
+      float dist2 = dot(toL,toL);
       float dist = sqrt(dist2);
-      ldir /= dist;
-      float ndotl = max(0.0, dot(ldir, h.n));
-      if (ndotl > 0.0 && !intersectShadow(h.pos + h.n * SHADOW_BIAS, ldir, dist - 0.01)) {
-        float intensity = ndotl / dist2;
-        acc += mask * matCol * Lcol * intensity * 4.0;
+      vec3 Ldir = toL / dist;
+
+      float nl = max(0.0, dot(h.n, Ldir));
+      if (nl > 0.0) {
+        // shadow test
+        if (!occluded(nextRo, Ldir, dist - 0.01)) {
+          vec3 Li = u_lightCols[li] / dist2; // intensity falloff
+          accumCol += throughput * matCol * Li * nl;
+        }
       }
     }
 
-    float u1 = rnd(seed);
-    float u2 = rnd(seed);
-    vec3 newDir = sampleHemisphere(h.n, u1, u2);
-    ro = h.pos + h.n * SHADOW_BIAS;
+    // sample bounce direction (cosine hemisphere)
+    float rr1 = rnd(state);
+    float rr2 = rnd(state);
+    vec3 newDir = sampleHemisphere(h.n, rr1, rr2);
     rd = newDir;
-    mask *= matCol;
+    ro = nextRo;
 
-    if (depth >= 2) {
-      float p = max(mask.r, max(mask.g, mask.b));
-      if (rnd(seed) > p) break;
-      mask /= p;
+    throughput *= matCol;
+
+    // Russian roulette after 2 bounces
+    if (bounce >= 1) {
+      float p = max(throughput.r, max(throughput.g, throughput.b));
+      if (rnd(state) > p) break;
+      throughput /= max(1e-6, p);
     }
   }
 
-  vec3 outAccum = prev + acc;
-  outColor = vec4(outAccum, 1.0);
+  // accumulate: write prev + sample
+  vec3 newSum = prev.rgb + accumCol;
+  outColor = vec4(newSum, 1.0);
 }
 `;
 
-// Display pass: show accum / frameCount with gamma (sqrt)
-const FRAG_DISPLAY_SRC = `#version 300 es
+// Fragment for final display: read accumulated sum, divide by frameCount, apply gamma sqrt and write to default framebuffer
+const fragDisplaySrc = `#version 300 es
 precision highp float;
 in vec2 v_uv;
-out vec4 outColor;
+out vec4 fragColor;
 uniform sampler2D u_accum;
-uniform int u_frame;
+uniform float u_displayFrame; // number of samples accumulated
 void main(){
   vec3 sum = texture(u_accum, v_uv).rgb;
-  float f = max(1, u_frame);
-  vec3 col = sum / float(f);
-  col = sqrt(col);
-  outColor = vec4(col, 1.0);
+  vec3 avg = sum / max(1.0, u_displayFrame);
+  // fast gamma 2.0
+  vec3 col = sqrt(max(vec3(0.0), avg));
+  fragColor = vec4(col,1.0);
 }
 `;
 
-// GL helpers
-function createShader(gl, type, src){
+// --- GL helpers
+function compileShader(src, type) {
   const s = gl.createShader(type);
   gl.shaderSource(s, src);
   gl.compileShader(s);
-  if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)){
-    const log = gl.getShaderInfoLog(s);
-    console.error("Shader compile error", log);
-    throw new Error(log);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(s));
+    throw new Error('Shader compile error');
   }
   return s;
 }
-function createProgram(gl, vsSrc, fsSrc){
-  const vs = createShader(gl, gl.VERTEX_SHADER, vsSrc);
-  const fs = createShader(gl, gl.FRAGMENT_SHADER, fsSrc);
+function linkProgram(vs, fs) {
   const p = gl.createProgram();
   gl.attachShader(p, vs);
   gl.attachShader(p, fs);
+  gl.bindAttribLocation(p, 0, 'a_pos');
   gl.linkProgram(p);
-  if(!gl.getProgramParameter(p, gl.LINK_STATUS)){
-    const log = gl.getProgramInfoLog(p);
-    console.error("Program link error", log);
-    throw new Error(log);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    console.error(gl.getProgramInfoLog(p));
+    throw new Error('Link error');
   }
   return p;
 }
 
-const canvas = document.getElementById('glcanvas');
-const msg = document.getElementById('msg');
-const gl = canvas.getContext('webgl2', { antialias:false });
-if(!gl){ msg.textContent = "WebGL2 unsupported."; throw new Error("No WebGL2"); }
-const ext = gl.getExtension('EXT_color_buffer_float');
-if(!ext){ msg.textContent = "EXT_color_buffer_float missing."; throw new Error("No ext"); }
+// fullscreen quad
+const quadVBO = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, quadVBO);
+const quadVerts = new Float32Array([
+  -1,-1,  1,-1,  -1,1,
+  -1,1,   1,-1,   1,1
+]);
+gl.bufferData(gl.ARRAY_BUFFER, quadVerts, gl.STATIC_DRAW);
 
-// quad
-const quadBuf = gl.createBuffer();
-gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
-gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, -1,1, 1,-1, 1,1]), gl.STATIC_DRAW);
+// compile programs
+const vs = compileShader(vertSrc, gl.VERTEX_SHADER);
+const fsTrace = compileShader(fragTraceSrc, gl.FRAGMENT_SHADER);
+const fsDisplay = compileShader(fragDisplaySrc, gl.FRAGMENT_SHADER);
+const progTrace = linkProgram(vs, fsTrace);
+const progDisplay = linkProgram(vs, fsDisplay);
 
-// programs
-const progSample = createProgram(gl, VERT_SRC, FRAG_SAMPLE_SRC);
-const progDisplay = createProgram(gl, VERT_SRC, FRAG_DISPLAY_SRC);
+// get uniform locations for trace program
+const traceUniforms = {
+  u_prevAccum: gl.getUniformLocation(progTrace, 'u_prevAccum'),
+  u_frame: gl.getUniformLocation(progTrace, 'u_frame'),
+  u_resolution: gl.getUniformLocation(progTrace, 'u_resolution'),
+  u_time: gl.getUniformLocation(progTrace, 'u_time'),
+  u_camPos: gl.getUniformLocation(progTrace, 'u_camPos'),
+  u_camF: gl.getUniformLocation(progTrace, 'u_camF'),
+  u_camR: gl.getUniformLocation(progTrace, 'u_camR'),
+  u_camU: gl.getUniformLocation(progTrace, 'u_camU'),
+  u_sphereCount: gl.getUniformLocation(progTrace, 'u_sphereCount'),
+  u_planeY: gl.getUniformLocation(progTrace, 'u_planeY'),
+  u_planeMat: gl.getUniformLocation(progTrace, 'u_planeMat'),
+  u_materialCount: gl.getUniformLocation(progTrace, 'u_materialCount'),
+  u_lightCount: gl.getUniformLocation(progTrace, 'u_lightCount'),
+  // arrays: set by name below
+};
 
-// scene (from your original)
-const SPHERES = [
-  {cx: 0, cy: 0.5, cz: -0.5, rad: 1.0, mat: 0},
-  {cx: 1.8, cy: 0.2, cz: 0.5, rad: 0.7, mat: 1},
-  {cx: -1.8, cy: 0.2, cz: 0.0, rad: 0.7, mat: 2}
-];
-const MATERIALS = [
-  {r:0.9,g:0.2,b:0.2},
-  {r:0.7,g:0.7,b:0.7},
-  {r:0.2,g:0.3,b:0.9},
-  {r:0.9,g:0.9,b:0.9},
-  {r:0.1,g:0.1,b:0.1}
-];
-const LIGHTS = [
-  {x:-5,y:8,z:5,rad:1.5, r:15,g:15,b:15},
-  {x:5,y:5,z:2,rad:1.0, r:5,g:5,b:5}
-];
+// display uniforms
+const dispUniforms = {
+  u_accum: gl.getUniformLocation(progDisplay, 'u_accum'),
+  u_displayFrame: gl.getUniformLocation(progDisplay, 'u_displayFrame')
+};
 
-function setSceneUniforms(gl, prog){
-  gl.useProgram(prog);
-  gl.uniform1i(gl.getUniformLocation(prog, "u_sphereCount"), Math.min(8, SPHERES.length));
-  const spheresArr = new Float32Array(4*8);
-  const matIdx = new Int32Array(8);
-  for(let i=0;i<Math.min(8,SPHERES.length);i++){
-    const s = SPHERES[i];
-    spheresArr[i*4+0] = s.cx; spheresArr[i*4+1] = s.cy; spheresArr[i*4+2] = s.cz; spheresArr[i*4+3] = s.rad;
-    matIdx[i] = s.mat|0;
-  }
-  gl.uniform4fv(gl.getUniformLocation(prog, "u_spheres"), spheresArr);
-  gl.uniform1iv(gl.getUniformLocation(prog, "u_sphereMatIdx"), matIdx);
-
-  gl.uniform1i(gl.getUniformLocation(prog, "u_matCount"), MATERIALS.length);
-  const matsArr = new Float32Array(3*16);
-  for(let i=0;i<MATERIALS.length;i++){
-    matsArr[i*3+0] = MATERIALS[i].r; matsArr[i*3+1] = MATERIALS[i].g; matsArr[i*3+2] = MATERIALS[i].b;
-  }
-  gl.uniform3fv(gl.getUniformLocation(prog, "u_mats"), matsArr);
-
-  const lc = Math.min(8, LIGHTS.length);
-  gl.uniform1i(gl.getUniformLocation(prog, "u_lightCount"), lc);
-  const lightsArr = new Float32Array(4*8);
-  const lcolsArr = new Float32Array(3*8);
-  for(let i=0;i<lc;i++){
-    const L = LIGHTS[i];
-    lightsArr[i*4+0] = L.x; lightsArr[i*4+1] = L.y; lightsArr[i*4+2] = L.z; lightsArr[i*4+3] = L.rad;
-    lcolsArr[i*3+0] = L.r; lcolsArr[i*3+1] = L.g; lcolsArr[i*3+2] = L.b;
-  }
-  gl.uniform4fv(gl.getUniformLocation(prog, "u_lights"), lightsArr);
-  gl.uniform3fv(gl.getUniformLocation(prog, "u_lightCols"), lcolsArr);
+// helper to set up attribute
+function bindQuadToProgram() {
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadVBO);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
 }
-setSceneUniforms(gl, progSample);
 
-// ping-pong accumulation textures and FBO
-let accumTex = [null, null];
-let accumFBO = gl.createFramebuffer();
-let w = 1, h = 1;
-function createAccumTextures(newW, newH){
-  w = newW; h = newH;
-  for(let i=0;i<2;i++){
-    if(accumTex[i]) gl.deleteTexture(accumTex[i]);
+// create ping-pong float textures + framebuffers
+let tex = [null, null], fb = [null, null];
+function createAccumBuffers(w,h) {
+  for (let i=0;i<2;i++) {
+    if (tex[i]) {
+      gl.deleteTexture(tex[i]);
+      gl.deleteFramebuffer(fb[i]);
+    }
     const t = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, t);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, null);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    accumTex[i] = t;
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, null);
+
+    const f = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    if (status !== gl.FRAMEBUFFER_COMPLETE) {
+      console.warn('Framebuffer incomplete', status);
+    }
+
+    tex[i] = t;
+    fb[i] = f;
   }
-  // clear both to zero
-  gl.bindFramebuffer(gl.FRAMEBUFFER, accumFBO);
-  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, accumTex[0], 0);
-  gl.clearColor(0,0,0,0); gl.clear(gl.COLOR_BUFFER_BIT);
-  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, accumTex[1], 0);
-  gl.clearColor(0,0,0,0); gl.clear(gl.COLOR_BUFFER_BIT);
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 }
 
-function bindQuadAttribs(gl, prog){
-  const loc = gl.getAttribLocation(prog, "a_pos");
-  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
-  gl.enableVertexAttribArray(loc);
-  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+// fullscreen resize & DPI
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const width = Math.max(1, Math.floor(window.innerWidth * dpr));
+  const height = Math.max(1, Math.floor(window.innerHeight * dpr));
+  canvas.width = width;
+  canvas.height = height;
+  canvas.style.width = window.innerWidth + 'px';
+  canvas.style.height = window.innerHeight + 'px';
+  gl.viewport(0,0,width,height);
+  createAccumBuffers(width, height);
+  frame = 0;
+  updateFrameInfo();
+}
+window.addEventListener('resize', () => { resize(); resetAccumulation(); });
+
+// camera state
+let camDist = 7.0;
+let camAzi = Math.PI/2 + 0.5;
+let camEle = 0.4;
+let camTarget = { x:0, y:0.2, z:0 };
+let camPos = [0,0,0], camF=[0,0,0], camR=[0,0,0], camU=[0,0,0];
+
+function updateCamera() {
+  const y = camDist * Math.sin(camEle);
+  const r = camDist * Math.cos(camEle);
+  camPos[0] = camTarget.x + r * Math.sin(camAzi);
+  camPos[1] = camTarget.y + y;
+  camPos[2] = camTarget.z + r * Math.cos(camAzi);
+
+  let fx = camTarget.x - camPos[0];
+  let fy = camTarget.y - camPos[1];
+  let fz = camTarget.z - camPos[2];
+  let flen = Math.hypot(fx,fy,fz);
+  camF[0] = fx / flen; camF[1] = fy / flen; camF[2] = fz / flen;
+
+  // right vector (approx)
+  let rx = camF[2];
+  let ry = 0;
+  let rz = -camF[0];
+  let rlen = Math.hypot(rx,ry,rz);
+  camR[0] = rx / rlen; camR[1] = ry / rlen; camR[2] = rz / rlen;
+
+  camU[0] = camR[1]*camF[2] - camR[2]*camF[1];
+  camU[1] = camR[2]*camF[0] - camR[0]*camF[2];
+  camU[2] = camR[0]*camF[1] - camR[1]*camF[0];
+
+  // scale to viewport fov
+  const fov = 60.0 * Math.PI/180.0;
+  const h = 2.0 * Math.tan(0.5 * fov);
+  const aspect = canvas.width / canvas.height;
+  const vpW = h * aspect;
+  // scale camR and camU to viewport width/height
+  camR[0] *= vpW; camR[1] *= vpW; camR[2] *= vpW;
+  camU[0] *= h; camU[1] *= h; camU[2] *= h;
+  resetAccumulation();
 }
 
-// DPR-aware resize
-function resize(){
-  const dpr = window.devicePixelRatio || 1;
-  const cw = Math.max(1, Math.floor(window.innerWidth * dpr));
-  const ch = Math.max(1, Math.floor(window.innerHeight * dpr));
-  canvas.width = cw; canvas.height = ch;
-  canvas.style.width = window.innerWidth + "px";
-  canvas.style.height = window.innerHeight + "px";
-  gl.viewport(0,0,cw,ch);
-  createAccumTextures(cw,ch);
-  frameCount = 0;
-  curIdx = 0; nextIdx = 1;
-}
-window.addEventListener('resize', resize);
-
-// camera and interaction
-let cam = { dist:7.0, azi: Math.PI/2 + 0.5, ele:0.4, target:{x:0,y:0.2,z:0} };
-function computeCam(){
-  const y = cam.dist * Math.sin(cam.ele);
-  const r = cam.dist * Math.cos(cam.ele);
-  const camX = cam.target.x + r * Math.sin(cam.azi);
-  const camY = cam.target.y + y;
-  const camZ = cam.target.z + r * Math.cos(cam.azi);
-  let fx = cam.target.x - camX, fy = cam.target.y - camY, fz = cam.target.z - camZ;
-  const fl = Math.hypot(fx,fy,fz); fx/=fl; fy/=fl; fz/=fl;
-  let rx = fz, ry = 0, rz = -fx;
-  const rl = Math.hypot(rx,ry,rz); rx/=rl; ry/=rl; rz/=rl;
-  const ux = ry * fz - rz * fy, uy = rz * fx - rx * fz, uz = rx * fy - ry * fx;
-  return { pos:[camX,camY,camZ], forward:[fx,fy,fz], right:[rx,ry,rz], up:[ux,uy,uz] };
-}
-let camBasis = computeCam();
-let dragging=false, lastX=0, lastY=0;
-canvas.addEventListener('mousedown', e => { dragging=true; lastX=e.clientX; lastY=e.clientY; });
-window.addEventListener('mouseup', ()=> { dragging=false; });
-window.addEventListener('mousemove', e => {
-  if(!dragging) return;
+// user interaction
+let isDragging = false, lastX=0, lastY=0;
+canvas.addEventListener('mousedown', (e)=>{ isDragging=true; lastX=e.clientX; lastY=e.clientY; });
+window.addEventListener('mouseup', ()=>{ isDragging=false; });
+window.addEventListener('mousemove', (e)=>{
+  if(!isDragging) return;
   const dx = (e.clientX - lastX) * 0.005;
   const dy = (e.clientY - lastY) * 0.005;
-  cam.azi -= dx;
-  cam.ele = Math.max(-1.5, Math.min(1.5, cam.ele + dy));
+  camAzi -= dx;
+  camEle = Math.max(-1.5, Math.min(1.5, camEle + dy));
   lastX = e.clientX; lastY = e.clientY;
-  camBasis = computeCam();
-  frameCount = 0;
+  updateCamera();
 });
-canvas.addEventListener('wheel', e => { e.preventDefault(); cam.dist = Math.max(2, Math.min(20, cam.dist + e.deltaY * 0.01)); camBasis = computeCam(); frameCount = 0; }, {passive:false});
+canvas.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  camDist = Math.max(2, Math.min(20, camDist + e.deltaY * 0.01));
+  updateCamera();
+},{passive:false});
 
-// accumulation ping-pong indexes
-let curIdx = 0, nextIdx = 1;
-let frameCount = 0;
+let frame = 0;
+function updateFrameInfo(){ infoFrame.textContent = String(frame); }
 
-// initialize and start
-resize();
+// reset accumulation
+function resetAccumulation() {
+  frame = 0;
+  // clear both accumulation textures to zero
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb[0]);
+  gl.clearColor(0,0,0,0);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb[1]);
+  gl.clearColor(0,0,0,0);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  updateFrameInfo();
+}
 
-function render(){
-  const cw = canvas.width, ch = canvas.height;
-
-  // 1) SAMPLE+ACCUMULATE: read accum[curIdx], write accum[nextIdx]
-  gl.bindFramebuffer(gl.FRAMEBUFFER, accumFBO);
-  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, accumTex[nextIdx], 0);
-  if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
-    console.error("FBO not complete");
-    msg.textContent = "FBO incomplete";
-    return;
+// upload scene uniforms (spheres, materials, lights)
+function setSceneUniforms() {
+  gl.useProgram(progTrace);
+  gl.uniform1i(traceUniforms.u_sphereCount, Spheres.length);
+  // spheres
+  for (let i=0;i<MAX_SPHERES;i++) {
+    const name = `u_spheres[${i}]`;
+    const loc = gl.getUniformLocation(progTrace, name);
+    if (i < Spheres.length) {
+      const s = Spheres[i];
+      gl.uniform4f(loc, s.cx, s.cy, s.cz, s.rad);
+    } else {
+      gl.uniform4f(loc, 0,0,0,0);
+    }
+    const locMat = gl.getUniformLocation(progTrace, `u_sphereMat[${i}]`);
+    gl.uniform1i(locMat, i < Spheres.length ? Spheres[i].mat : 0);
   }
+  gl.uniform1f(traceUniforms.u_planeY, Plane.y);
+  gl.uniform1i(traceUniforms.u_planeMat, Plane.mat);
 
-  gl.viewport(0,0,cw,ch);
-  gl.useProgram(progSample);
-  bindQuadAttribs(gl, progSample);
+  // materials
+  for (let i=0;i<Materials.length;i++){
+    const loc = gl.getUniformLocation(progTrace, `u_materials[${i}]`);
+    const m = Materials[i];
+    gl.uniform3f(loc, m.r, m.g, m.b);
+  }
+  gl.uniform1i(traceUniforms.u_materialCount, Materials.length);
 
-  // bind prev accumulation as texture unit 0
+  // lights
+  gl.uniform1i(traceUniforms.u_lightCount, Lights.length);
+  for (let i=0;i<MAX_LIGHTS;i++){
+    const locL = gl.getUniformLocation(progTrace, `u_lights[${i}]`);
+    const locCol = gl.getUniformLocation(progTrace, `u_lightCols[${i}]`);
+    if (i < Lights.length) {
+      const L = Lights[i];
+      gl.uniform4f(locL, L.x, L.y, L.z, L.rad);
+      gl.uniform3f(locCol, L.r, L.g, L.b);
+    } else {
+      gl.uniform4f(locL, 0,0,0,0);
+      gl.uniform3f(locCol, 0,0,0);
+    }
+  }
+}
+
+// main render loop (ping-pong accumulation)
+let writeIndex = 0, readIndex = 1;
+function render() {
+  // trace pass: read from tex[readIndex], write to fb[writeIndex]
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb[writeIndex]);
+  gl.useProgram(progTrace);
+  bindQuadToProgram();
+
+  // set generic uniforms
   gl.activeTexture(gl.TEXTURE0);
-  gl.bindTexture(gl.TEXTURE_2D, accumTex[curIdx]);
-  gl.uniform1i(gl.getUniformLocation(progSample, "u_prevAccum"), 0);
+  gl.bindTexture(gl.TEXTURE_2D, tex[readIndex]);
+  gl.uniform1i(traceUniforms.u_prevAccum, 0);
+  gl.uniform1i(traceUniforms.u_frame, frame);
+  gl.uniform2f(traceUniforms.u_resolution, canvas.width, canvas.height);
+  gl.uniform1f(traceUniforms.u_time, performance.now() * 0.001);
+  gl.uniform3fv(traceUniforms.u_camPos, camPos);
+  gl.uniform3fv(traceUniforms.u_camF, camF);
+  gl.uniform3fv(traceUniforms.u_camR, camR);
+  gl.uniform3fv(traceUniforms.u_camU, camU);
 
-  gl.uniform2f(gl.getUniformLocation(progSample, "u_resolution"), cw, ch);
-  gl.uniform1i(gl.getUniformLocation(progSample, "u_frame"), frameCount);
+  setSceneUniforms();
 
-  // camera uniforms
-  gl.uniform3fv(gl.getUniformLocation(progSample, "u_camPos"), camBasis.pos);
-  gl.uniform3fv(gl.getUniformLocation(progSample, "u_camForward"), camBasis.forward);
-  gl.uniform3fv(gl.getUniformLocation(progSample, "u_camRight"), camBasis.right);
-  gl.uniform3fv(gl.getUniformLocation(progSample, "u_camUp"), camBasis.up);
-  gl.uniform1f(gl.getUniformLocation(progSample, "u_fov"), 0.9);
-  gl.uniform1f(gl.getUniformLocation(progSample, "u_aspect"), cw / ch);
-
-  // scene uniforms already set (spheres etc)
   gl.drawArrays(gl.TRIANGLES, 0, 6);
 
+  // display pass: draw to default framebuffer using tex[writeIndex]
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-
-  // 2) DISPLAY: sample accumTex[nextIdx] (the latest accumulation)
-  gl.viewport(0,0,cw,ch);
   gl.useProgram(progDisplay);
-  bindQuadAttribs(gl, progDisplay);
+  bindQuadToProgram();
   gl.activeTexture(gl.TEXTURE0);
-  gl.bindTexture(gl.TEXTURE_2D, accumTex[nextIdx]);
-  gl.uniform1i(gl.getUniformLocation(progDisplay, "u_accum"), 0);
-  gl.uniform1i(gl.getUniformLocation(progDisplay, "u_frame"), frameCount + 1);
+  gl.bindTexture(gl.TEXTURE_2D, tex[writeIndex]);
+  gl.uniform1i(dispUniforms.u_accum, 0);
+  gl.uniform1f(dispUniforms.u_displayFrame, frame + 1.0);
   gl.drawArrays(gl.TRIANGLES, 0, 6);
 
   // swap
-  curIdx = nextIdx;
-  nextIdx = 1 - curIdx;
-  frameCount++;
-
-  msg.textContent = `Frame: ${frameCount} — ${Math.round(cw/(window.devicePixelRatio||1))}×${Math.round(ch/(window.devicePixelRatio||1))} px`;
-
+  const tmp = writeIndex; writeIndex = readIndex; readIndex = tmp;
+  frame++;
+  updateFrameInfo();
   requestAnimationFrame(render);
 }
 
-// let GL errors get logged and start rendering
-try {
-  requestAnimationFrame(render);
-} catch(e){
-  console.error(e);
-  msg.textContent = "Render failed: " + e.message;
-}
+// initialize
+resize();
+updateCamera();
+setSceneUniforms();
+resetAccumulation();
+requestAnimationFrame(render);
+
 </script>
 </body>
 </html>
