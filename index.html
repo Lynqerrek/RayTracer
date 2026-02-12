@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>PathTracer</title>
+<title>Advanced Denoised Path Tracer</title>
 <style>
   html,body { height:100%; margin:0; background:#000; overflow:hidden; }
   canvas { display:block; width:100%; height:100%; }
@@ -14,10 +14,10 @@
     pointer-events: none; user-select: none;
     box-shadow: 0 4px 20px rgba(0,0,0,0.6);
   }
-  .row { display:flex; justify-content:space-between; margin-bottom:4px; min-width: 160px; }
+  .row { display:flex; justify-content:space-between; margin-bottom:4px; min-width: 180px; }
   .label { color:#888; }
   .val { color:#fff; font-weight:bold; }
-  .sub { font-size:11px; color:#666; margin-top:2px; }
+  .sub { font-size:11px; color:#4f4; margin-top:2px; font-weight: bold; }
   .status { margin-top:8px; padding-top:8px; border-top:1px solid rgba(255,255,255,0.1); font-size:11px; color:#aaa; }
   #error {
     position:fixed; top:50%; left:50%; transform:translate(-50%, -50%);
@@ -31,18 +31,20 @@
 <div id="ui">
   <div class="row"><span class="label">FPS:</span><span id="fpsVal" class="val">60</span></div>
   <div class="row"><span class="label">Samples:</span><span id="frameVal" class="val">0</span></div>
-  <div class="sub">Shadow-Optimized Denoising</div>
-  <div class="status">Status: <span id="denoiseStatus" style="color:#4f4">Stabilizing</span></div>
+  <div class="sub">A-Trous Wavelet Denoiser</div>
+  <div class="status">Status: <span id="denoiseStatus" style="color:#4f4">Ultra Clean</span></div>
 </div>
 <div id="error"></div>
 
 <script>
-/* GPU Path Tracer with Advanced Shadow Denoising
-   -------------------------------------------------
-   Fixes:
-   1. Adaptive Sigma: Bilateral filter blurs more in dark regions where noise is prominent.
-   2. Outlier Removal: Suppresses "fireflies" in the display pass.
-   3. Stable Reprojection: Keeps pixels "stuck" longer if the camera movement is sub-pixel.
+/* Advanced GPU Path Tracer with A-Trous Wavelet Denoising
+   --------------------------------------------------------
+   Improvements:
+   1. A-Trous multi-scale wavelet filter for edge-preserving denoising
+   2. Variance estimation and clipping for temporal stability
+   3. Stronger temporal accumulation with motion detection
+   4. Edge-aware filtering that preserves sharp features
+   5. Firefly removal with statistical outlier detection
 */
 
 const MAX_SPHERES = 8;
@@ -152,10 +154,12 @@ precision highp float;
 precision highp int;
 
 layout(location=0) out vec4 outColor; 
+layout(location=1) out vec4 outMoments; // Store mean and variance for temporal denoising
 
 in vec2 v_uv;
 
 uniform sampler2D u_prevAccum;
+uniform sampler2D u_prevMoments;
 uniform int u_frame;       
 uniform int u_motionFrame; 
 uniform vec2 u_resolution;
@@ -297,12 +301,13 @@ void main(){
     }
   }
   
-  vec3 currentRadiance = min(accum, vec3(12.0)); // Tighter clamp for shadow stability
+  vec3 currentRadiance = clamp(accum, vec3(0.0), vec3(20.0));
   vec3 worldPos = u_camPos + normalize(u_camF + u_camR * (v_uv.x - 0.5) + u_camU * (v_uv.y - 0.5)) * firstHitDist;
 
-  // Temporal Logic
+  // Enhanced Temporal Accumulation with Variance Tracking
   bool isValid = false;
   vec3 historyColor = vec3(0.0);
+  vec4 historyMoments = vec4(0.0);
   float blendFactor = 1.0; 
 
   if (hitSomething && u_frame > 0) {
@@ -311,22 +316,121 @@ void main(){
           vec2 prevUV = (prevClip.xy / prevClip.w) * 0.5 + 0.5;
           if (prevUV.x >= 0.0 && prevUV.x <= 1.0 && prevUV.y >= 0.0 && prevUV.y <= 1.0) {
               vec4 historySample = texture(u_prevAccum, prevUV);
+              historyMoments = texture(u_prevMoments, prevUV);
               float distToPrevCam = distance(u_prevCamPos, worldPos);
-              if (abs(historySample.a - distToPrevCam) < 0.03 * distToPrevCam) {
+              if (abs(historySample.a - distToPrevCam) < 0.05 * distToPrevCam) {
                   isValid = true;
                   historyColor = historySample.rgb;
                   float velocity = length(prevUV - v_uv);
-                  if (velocity < 0.00005) {
-                      blendFactor = 1.0 / min(float(u_motionFrame) + 1.0, 128.0);
+                  
+                  // Very aggressive temporal accumulation for near-zero motion
+                  if (velocity < 0.0001) {
+                      blendFactor = 1.0 / min(float(u_motionFrame) + 1.0, 256.0);
+                  } else if (velocity < 0.001) {
+                      blendFactor = 0.05; // Very slow blend
                   } else {
-                      blendFactor = 0.12; // Slower blend for smoother movement
+                      blendFactor = 0.08; // Still quite slow for moving camera
                   }
               }
           }
       }
   }
-  vec3 result = isValid ? mix(historyColor, currentRadiance, blendFactor) : currentRadiance;
+  
+  vec3 result;
+  vec4 moments;
+  
+  if (isValid) {
+      // Temporal variance clipping to reduce lag while preserving stability
+      vec3 m1 = historyMoments.rgb;
+      float m2 = historyMoments.a;
+      vec3 sigma = sqrt(max(vec3(0.0), m2 - dot(m1, m1)));
+      
+      // Clamp current sample to reduce fireflies before blending
+      vec3 clampedCurrent = clamp(currentRadiance, m1 - sigma * 2.5, m1 + sigma * 2.5);
+      
+      result = mix(historyColor, clampedCurrent, blendFactor);
+      
+      // Update moments
+      vec3 newM1 = mix(m1, currentRadiance, blendFactor);
+      float newM2 = mix(m2, dot(currentRadiance, currentRadiance), blendFactor);
+      moments = vec4(newM1, newM2);
+  } else {
+      result = currentRadiance;
+      moments = vec4(currentRadiance, dot(currentRadiance, currentRadiance));
+  }
+  
   outColor = vec4(result, firstHitDist);
+  outMoments = moments;
+}
+`;
+
+// A-Trous wavelet denoiser with edge-preserving filtering
+const fragDenoiseSrc = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+out vec4 fragColor;
+
+uniform sampler2D u_accum;
+uniform sampler2D u_moments;
+uniform vec2 u_resolution;
+uniform int u_iteration; // Which a-trous pass (0-4)
+
+float getLuma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+
+// A-Trous kernel (5-tap wavelet)
+const float kernel[3] = float[3](3.0/8.0, 1.0/4.0, 1.0/16.0);
+
+void main(){
+  ivec2 coord = ivec2(gl_FragCoord.xy);
+  vec4 centerSample = texelFetch(u_accum, coord, 0);
+  vec3 centerCol = centerSample.rgb;
+  float centerDepth = centerSample.a;
+  float centerLuma = getLuma(centerCol);
+  
+  // Get variance estimate
+  vec4 momentsSample = texelFetch(u_moments, coord, 0);
+  vec3 mean = momentsSample.rgb;
+  float variance = max(0.0, momentsSample.a - dot(mean, mean));
+  float sigma = sqrt(variance);
+  
+  // Adaptive parameters based on local variance
+  float sigmaN = max(0.01, sigma * 2.0); // Noise standard deviation
+  float sigmaDepth = 0.1;
+  
+  int stepSize = 1 << u_iteration; // 1, 2, 4, 8, 16
+  
+  vec3 sum = vec3(0.0);
+  float wSum = 0.0;
+  
+  // 5x5 wavelet kernel with a-trous spacing
+  for(int y = -2; y <= 2; ++y) {
+    for(int x = -2; x <= 2; ++x) {
+      ivec2 sampleCoord = coord + ivec2(x, y) * stepSize;
+      vec4 tapSample = texelFetch(u_accum, sampleCoord, 0);
+      vec3 tapCol = tapSample.rgb;
+      float tapDepth = tapSample.a;
+      
+      // Spatial kernel weight
+      float kw = kernel[abs(x)] * kernel[abs(y)];
+      
+      // Depth edge stopping
+      float depthDiff = abs(tapDepth - centerDepth) / max(0.01, centerDepth);
+      float wDepth = exp(-depthDiff / sigmaDepth);
+      
+      // Luminance edge stopping (preserve edges)
+      float tapLuma = getLuma(tapCol);
+      float lumaDiff = abs(tapLuma - centerLuma);
+      float wLuma = exp(-lumaDiff / (sigmaN + 0.001));
+      
+      float w = kw * wDepth * wLuma;
+      
+      sum += tapCol * w;
+      wSum += w;
+    }
+  }
+  
+  vec3 filtered = (wSum > 0.0) ? sum / wSum : centerCol;
+  fragColor = vec4(filtered, centerDepth);
 }
 `;
 
@@ -335,58 +439,16 @@ precision highp float;
 in vec2 v_uv;
 out vec4 fragColor;
 
-uniform sampler2D u_accum;
-uniform vec2 u_resolution;
-
-float getLuma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+uniform sampler2D u_denoised;
 
 void main(){
-  ivec2 coord = ivec2(gl_FragCoord.xy);
-  vec3 centerVal = texelFetch(u_accum, coord, 0).rgb;
-  float centerLuma = getLuma(centerVal);
-
-  // Outlier Suppression (Firefly filter)
-  // Check neighbors to see if center is way too bright
-  vec3 m1 = vec3(0.0);
-  vec3 m2 = vec3(0.0);
-  for(int x=-1; x<=1; x++) {
-      for(int y=-1; y<=1; y++) {
-          vec3 val = texelFetch(u_accum, coord + ivec2(x,y), 0).rgb;
-          m1 += val;
-          m2 += val * val;
-      }
-  }
-  vec3 mean = m1 / 9.0;
-  vec3 std = sqrt(max(vec3(0.0), (m2 / 9.0) - mean * mean));
-  centerVal = clamp(centerVal, mean - std * 3.0, mean + std * 3.0);
-
-  // ADAPTIVE BILATERAL FILTER
-  // sigmaColor should be larger in dark areas (shadows) to allow more blurring of noise
-  float sigmaSpace = 2.5;
-  float sigmaColor = mix(0.6, 0.15, smoothstep(0.0, 0.4, centerLuma)); 
+  vec3 color = texture(u_denoised, v_uv).rgb;
   
-  vec3 sum = vec3(0.0);
-  float wSum = 0.0;
+  // Tone mapping
+  color = color / (color + vec3(1.0)); // Reinhard
   
-  // 7x7 Optimized Kernel
-  for(int x=-3; x<=3; ++x){
-    for(int y=-3; y<=3; ++y){
-      vec3 tapVal = texelFetch(u_accum, coord + ivec2(x,y), 0).rgb;
-      float d2 = float(x*x + y*y);
-      float wSpace = exp(-d2 / (2.0 * sigmaSpace * sigmaSpace));
-      
-      float lumaTap = getLuma(tapVal);
-      float lDiff = lumaTap - centerLuma;
-      float wColor = exp(-(lDiff*lDiff) / (2.0 * sigmaColor * sigmaColor));
-      
-      float w = wSpace * wColor;
-      sum += tapVal * w;
-      wSum += w;
-    }
-  }
-  
-  vec3 finalColor = (wSum > 0.0) ? sum / wSum : centerVal;
-  fragColor = vec4(pow(finalColor, vec3(1.0/2.2)), 1.0);
+  // Gamma correction
+  fragColor = vec4(pow(color, vec3(1.0/2.2)), 1.0);
 }
 `;
 
@@ -407,8 +469,10 @@ function link(vs, fs) {
 
 const vs = compile(vertSrc, gl.VERTEX_SHADER);
 const fsTrace = compile(fragTraceSrc, gl.FRAGMENT_SHADER);
+const fsDenoise = compile(fragDenoiseSrc, gl.FRAGMENT_SHADER);
 const fsDisplay = compile(fragDisplaySrc, gl.FRAGMENT_SHADER);
 const progTrace = link(vs, fsTrace);
+const progDenoise = link(vs, fsDenoise);
 const progDisplay = link(vs, fsDisplay);
 
 const quadBuffer = gl.createBuffer();
@@ -417,6 +481,7 @@ gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, -1,1, 1,-1, 
 
 const locTrace = {
   prev: gl.getUniformLocation(progTrace, 'u_prevAccum'),
+  prevMoments: gl.getUniformLocation(progTrace, 'u_prevMoments'),
   frame: gl.getUniformLocation(progTrace, 'u_frame'),
   motionFrame: gl.getUniformLocation(progTrace, 'u_motionFrame'),
   res: gl.getUniformLocation(progTrace, 'u_resolution'),
@@ -428,18 +493,32 @@ const locTrace = {
   prevCamPos: gl.getUniformLocation(progTrace, 'u_prevCamPos'),
   prevViewProj: gl.getUniformLocation(progTrace, 'u_prevViewProj'),
 };
+const locDenoise = {
+  accum: gl.getUniformLocation(progDenoise, 'u_accum'),
+  moments: gl.getUniformLocation(progDenoise, 'u_moments'),
+  res: gl.getUniformLocation(progDenoise, 'u_resolution'),
+  iteration: gl.getUniformLocation(progDenoise, 'u_iteration')
+};
 const locDisplay = {
-  accum: gl.getUniformLocation(progDisplay, 'u_accum'),
-  res: gl.getUniformLocation(progDisplay, 'u_resolution')
+  denoised: gl.getUniformLocation(progDisplay, 'u_denoised')
 };
 
-let texCol = [null, null], fb = [null, null];
+let texCol = [null, null], texMoments = [null, null], fb = [null, null];
+let texDenoise = [null, null], fbDenoise = [null, null];
 let width=0, height=0;
 
 function initBuffers(w, h) {
   width = w; height = h;
+  
+  // Main accumulation buffers (2 for ping-pong)
   for(let i=0; i<2; i++) {
-    if (texCol[i]) { gl.deleteTexture(texCol[i]); gl.deleteFramebuffer(fb[i]); }
+    if (texCol[i]) { 
+      gl.deleteTexture(texCol[i]); 
+      gl.deleteTexture(texMoments[i]);
+      gl.deleteFramebuffer(fb[i]); 
+    }
+    
+    // Color + depth buffer
     texCol[i] = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, texCol[i]);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, null);
@@ -447,9 +526,41 @@ function initBuffers(w, h) {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    
+    // Moments buffer (for variance tracking)
+    texMoments[i] = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, texMoments[i]);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    
     fb[i] = gl.createFramebuffer();
     gl.bindFramebuffer(gl.FRAMEBUFFER, fb[i]);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texCol[i], 0);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, texMoments[i], 0);
+    gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
+  }
+  
+  // Denoise buffers (2 for multi-pass a-trous)
+  for(let i=0; i<2; i++) {
+    if (texDenoise[i]) { 
+      gl.deleteTexture(texDenoise[i]); 
+      gl.deleteFramebuffer(fbDenoise[i]); 
+    }
+    
+    texDenoise[i] = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, texDenoise[i]);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    
+    fbDenoise[i] = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbDenoise[i]);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texDenoise[i], 0);
   }
 }
 
@@ -524,14 +635,26 @@ function setUniforms() {
 }
 
 let ping = 0;
+let lastTime = performance.now();
+let fpsFrames = 0;
+let fpsTime = 0;
+
 function draw() {
   const pong = 1 - ping;
+  
+  // Step 1: Path trace
   gl.useProgram(progTrace);
   gl.bindFramebuffer(gl.FRAMEBUFFER, fb[ping]);
   gl.viewport(0,0,width,height);
+  
   gl.activeTexture(gl.TEXTURE0);
   gl.bindTexture(gl.TEXTURE_2D, texCol[pong]);
   gl.uniform1i(locTrace.prev, 0);
+  
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, texMoments[pong]);
+  gl.uniform1i(locTrace.prevMoments, 1);
+  
   gl.uniform1i(locTrace.frame, frame);
   gl.uniform1i(locTrace.motionFrame, motionFrame);
   gl.uniform2f(locTrace.res, width, height);
@@ -543,30 +666,77 @@ function draw() {
   gl.uniform3fv(locTrace.prevCamPos, lastRenderedCamPos);
   gl.uniformMatrix4fv(locTrace.prevViewProj, false, lastRenderedViewProj);
   setUniforms();
+  
   gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
   gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
   gl.enableVertexAttribArray(0);
   gl.drawArrays(gl.TRIANGLES, 0, 6);
   
+  // Step 2: Multi-pass A-Trous denoising (5 iterations with increasing step size)
+  gl.useProgram(progDenoise);
+  
+  let denoisePing = 0;
+  let inputTex = texCol[ping]; // Start with path traced result
+  
+  for(let iter = 0; iter < 5; iter++) {
+    const denoisePong = 1 - denoisePing;
+    
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbDenoise[denoisePong]);
+    gl.viewport(0,0,width,height);
+    
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, inputTex);
+    gl.uniform1i(locDenoise.accum, 0);
+    
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, texMoments[ping]);
+    gl.uniform1i(locDenoise.moments, 1);
+    
+    gl.uniform2f(locDenoise.res, width, height);
+    gl.uniform1i(locDenoise.iteration, iter);
+    
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    
+    inputTex = texDenoise[denoisePong];
+    denoisePing = denoisePong;
+  }
+  
+  // Step 3: Display with tone mapping
   gl.useProgram(progDisplay);
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   gl.viewport(0,0,width,height);
-  gl.bindTexture(gl.TEXTURE_2D, texCol[ping]); 
-  gl.uniform1i(locDisplay.accum, 0);
-  gl.uniform2f(locDisplay.res, width, height);
+  
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, inputTex); // Use final denoised result
+  gl.uniform1i(locDisplay.denoised, 0);
+  
   gl.drawArrays(gl.TRIANGLES, 0, 6);
   
   frame++; motionFrame++; ping = pong;
   Mat4.copy(lastRenderedViewProj, viewProj);
   lastRenderedCamPos.set(camVecs.pos);
   uiFrame.textContent = frame;
+  
+  // FPS counter
+  const now = performance.now();
+  fpsFrames++;
+  fpsTime += now - lastTime;
+  if (fpsTime > 500) {
+    uiFps.textContent = Math.round(fpsFrames / fpsTime * 1000);
+    fpsFrames = 0;
+    fpsTime = 0;
+  }
+  lastTime = now;
+  
   requestAnimationFrame(draw);
 }
 
 function onResize() {
   const dpr = Math.min(window.devicePixelRatio||1, 2);
-  canvas.width = window.innerWidth * dpr; canvas.height = window.innerHeight * dpr;
-  initBuffers(canvas.width, canvas.height); updateCamVecs(true);
+  canvas.width = window.innerWidth * dpr; 
+  canvas.height = window.innerHeight * dpr;
+  initBuffers(canvas.width, canvas.height); 
+  updateCamVecs(true);
 }
 window.addEventListener('resize', onResize);
 onResize();
